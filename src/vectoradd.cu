@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <type_traits>
 #include <vector>
+#include <cmath>
 
 #include "cudaVector.cuh"
 
@@ -316,6 +317,10 @@ void cudaVectorAdd(cudaVector<T> &a, cudaVector<T> &b, cudaVector<T> &dest) {
 
   std::cout << "D2H Samples \n";
   OutStats(d2h_samples, a.size(), sizeof(T), 1);
+
+  cudaFree(a_data);
+  cudaFree(b_data);
+  cudaFree(c_data);
 }
 
 // With streams we can chunk the data up
@@ -351,10 +356,10 @@ void cudaVectorAddStreams(cudaVector<T> &a, cudaVector<T> &b,
 
   for (size_t j = 0; j < 5; j++) {
     for (size_t i = 0; i < stream_num; i++) {
-      size_t start = i * chunkSize;
-      size_t elemCount = std::min(chunkSize, a.size() - start);
+      size_t offset = i * chunkSize;
+      size_t elemCount = std::min(chunkSize, a.size() - offset);
       VectorAdd<<<grid, threads, 0, streams[i]>>>(
-          a_data + start, b_data + start, c_data + start, elemCount);
+          a_data + offset, b_data + offset, c_data + offset, elemCount);
     }
 
     cudaDeviceSynchronize();
@@ -421,6 +426,9 @@ void cudaVectorAddStreams(cudaVector<T> &a, cudaVector<T> &b,
 
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
+  cudaFree(a_data);
+  cudaFree(b_data);
+  cudaFree(c_data);
 }
 
 // CPU only implementation
@@ -442,6 +450,7 @@ std::vector<T> VectorAddCPU(std::vector<T> &a, std::vector<T> &b) {
             t1 - t0);
     samples.push_back(ms.count());
   }
+  volatile T sink = result[result.size()/2];
 
   OutStats(samples, a.size(), sizeof(T), 3);
   return result;
