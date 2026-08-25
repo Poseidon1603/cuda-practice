@@ -1,139 +1,504 @@
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cuda_device_runtime_api.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
 #include <iostream>
 #include <numeric>
+#include <ratio>
+#include <stdexcept>
 #include <stdlib.h>
-#include <vector>
 #include <type_traits>
+#include <vector>
 
-using namespace std;
+#include "cudaVector.cuh"
+
+template <typename T> __global__ void VectorAdd(T *a, T *b, T *dest, int size) {
+  // This gives the global thread we are on
+  // gridDim.x gives the number of blocks per grid
+  // blockDim.x gives the number of threads per block
+  // blockIdx.x gives the index of the block we are on
+  // ThreadIdx.x gives the thread in the block that we are on
+  // int index = blockDim.x * blockIdx.x + threadIdx.x;
+  // int stride = blockDim.x * gridDim.x gives you the max number of threads you
+  // can run at once
+
+  // Running just threadIdx.x gives the local thread that we are on inside the
+  // block
+  int idx = blockDim.x * blockIdx.x + threadIdx.x;
+  int stride = blockDim.x * gridDim.x;
+  for (int i = idx; i < size; i += stride) {
+    dest[i] = a[i] + b[i];
+  }
+
+  return;
+}
+
+template <typename T> std::pair<int, int> gridSize(int threadsPerBlock = 256) {
+  cudaDeviceProp prop;
+  int deviceID = 0;
+  cudaGetDeviceProperties(&prop, deviceID);
+  int numSMs = prop.multiProcessorCount;
+
+  // Calculate optimal number of blocks (per sm) to use at 256 threads
+  int maxBlockPerSM = 0;
+  size_t dynamicSMemSize = 0;
+  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &maxBlockPerSM, VectorAdd<T>, threadsPerBlock, dynamicSMemSize);
+  return {numSMs * maxBlockPerSM, threadsPerBlock};
+};
 
 template <typename T>
-__global__ void VectorAdd(T* a, T* b, T* dest, int size) {
-    // This gives the global thread we are on 
-    // gridDim.x gives the number of blocks per grid
-    // blockDim.x gives the number of threads per block
-    // blockIdx.x gives the index of the block we are on
-    // ThreadIdx.x gives the thread in the block that we are on
-    // int index = blockDim.x * blockIdx.x + threadIdx.x;
-    // int stride = blockDim.x * gridDim.x gives you the max number of threads you can run at once
-    
+void OutStats(std::vector<T> &samples, size_t vectorsize, size_t typesize,
+              size_t arraystouched) {
+  if (samples.empty()) {
+    std::cout << "Samples are empty" << "\n";
+  }
+  float total = 0;
 
-    // Running just threadIdx.x gives the local thread that we are on inside the block
-    int idx = blockDim.x * blockIdx.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-    for (int i = idx; i < size; i+= stride) {
-        dest[i] = a[i] + b[i];
-    }
+  for (const auto &sample : samples) {
+    // std::cout << sample << "\n";
+    total += sample;
+  }
 
-    return; 
+  std::cout << "Mean: " << total / samples.size() << "ms" << "\n";
+
+  // Sorted for median
+  std::sort(samples.begin(), samples.end());
+  size_t m = samples.size();
+  float median = m % 2 == 0 ? (samples[m / 2 - 1] + samples[m / 2]) / 2.0f
+                            : samples[m / 2];
+
+  std::cout << "Median: " << median << "ms" << "\n";
+  std::cout << "Min: " << samples.front() << "ms" << "\n";
+  std::cout << "Top 5%: " << samples[round(samples.size() * 0.05)] << "ms"
+            << "\n";
+  std::cout << "Top 25%: " << samples[round(samples.size() * 0.25)] << "ms"
+            << "\n";
+  std::cout << "Bottom 5%: " << samples[round(samples.size() * 0.95)] << "ms"
+            << "\n";
+  std::cout << "Bottom 25%: " << samples[round(samples.size() * 0.75)] << "ms"
+            << "\n";
+
+  std::cout << "BANDWIDTH (gb/s) \n";
+  std::cout << "Median Bandwidth: "
+            << (arraystouched * vectorsize * typesize) / 1e9 / (median / 1000)
+            << "\n";
+  std::cout << "Min (Runtime) Bandwidth: "
+            << (arraystouched * vectorsize * typesize) / 1e9 /
+                   (samples.front() / 1000)
+            << "\n";
 }
 
 // Using the kernel (assumes a.size() == b.size())
 template <typename T>
-void VectorAddSetup(vector<T>& a, vector<T>& b, vector<T>& c) {
+void VectorAddSetup(std::vector<T> &a, std::vector<T> &b, std::vector<T> &c) {
+  c.resize(a.size());
 
-    T *a_data, *b_data, *c_data;
+  // Get our data ready
+  T *a_data, *b_data, *c_data;
+  cudaMalloc(&a_data, sizeof(T) * a.size());
+  cudaMalloc(&b_data, sizeof(T) * b.size());
+  cudaError_t c_error = cudaMalloc(&c_data, sizeof(T) * c.size());
+  cudaEvent_t start, stop, h2d_start, h2d_stop, d2h_start, d2h_stop, k_start,
+      k_stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventCreate(&h2d_start);
+  cudaEventCreate(&h2d_stop);
+  cudaEventCreate(&d2h_start);
+  cudaEventCreate(&d2h_stop);
+  cudaEventCreate(&k_start);
+  cudaEventCreate(&k_stop);
 
-    c.resize(a.size());
+  auto [grid, threads] = gridSize<T>();
 
-    // Allocate VRAM for a
-    cudaMalloc(&a_data, sizeof(T) * a.size());
+  // Warmup runs
+  for (int i = 0; i < 100; i++) {
+    cudaError_t a_error = cudaMemcpy(a_data, a.data(), sizeof(T) * a.size(),
+                                     cudaMemcpyHostToDevice);
+    cudaError_t b_error = cudaMemcpy(b_data, b.data(), sizeof(T) * b.size(),
+                                     cudaMemcpyHostToDevice);
 
-    // Allocate VRAM for b
-    cudaMalloc(&b_data, sizeof(T) * b.size());
+    if (a_error != cudaSuccess || b_error != cudaSuccess) {
+      throw std::runtime_error("cudaMemcpy failed");
+    }
 
-    // Allocate VRAM for c
-    cudaError_t a_error = cudaMalloc(&c_data, sizeof(T) * c.size());
+    VectorAdd<<<grid, threads>>>(a_data, b_data, c_data, a.size());
 
-    // copy into VRAM
-    cudaError_t b_error = cudaMemcpy(a_data, a.data(), sizeof(T) * a.size(), cudaMemcpyHostToDevice);
+    cudaError_t c_out = cudaMemcpy(c.data(), c_data, sizeof(T) * c.size(),
+                                   cudaMemcpyDeviceToHost);
 
-    cudaError_t c_error = cudaMemcpy(b_data, b.data(), sizeof(T) * b.size(), cudaMemcpyHostToDevice);
+    if (c_out != cudaSuccess)
+      throw std::runtime_error("Failed to copy back to host");
+  }
 
-    // Get number of streaming multiprocessors
-    cudaDeviceProp prop;
-    int deviceID = 0;
-    cudaGetDeviceProperties(&prop, deviceID);
-    int numSMs = prop.multiProcessorCount;
+  cudaDeviceSynchronize();
 
-    // Calculate optimal number of blocks (per sm) to use at 256 threads
-    int maxBlockPerSM = 0;
-    int threadsPerBlock = 256;
-    size_t dynamicSMemSize = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&maxBlockPerSM, VectorAdd<T>, threadsPerBlock, dynamicSMemSize);
-    
-    VectorAdd<<<numSMs * maxBlockPerSM, threadsPerBlock>>>(a_data, b_data, c_data, a.size());
+  // Confirm correctnes
+  for (size_t i = 0; i < c.size(); i++) {
+    if (c[i] != (a[i] + b[i])) {
+      std::cout << c[i] << "\n";
+      std::cout << b[i] << "\n";
+      std::cout << a[i] << "\n";
+      throw std::runtime_error("Addition is incorrect");
+    }
+  }
 
-    // Copy back to host
-    cudaMemcpy(c.data(), c_data, sizeof(T) * c.size(), cudaMemcpyDeviceToHost);
+  std::vector<float> samples, h2d_samples, d2h_samples, k_samples;
+  for (int i = 0; i < 1000; ++i) {
+    // Record overall time taken
+    cudaEventRecord(start);
 
-    cudaFree(a_data);
-    cudaFree(b_data);
-    cudaFree(c_data);
+    // Record Time Taken to H2D
+    cudaEventRecord(h2d_start);
+    cudaError_t a_err = cudaMemcpy(a_data, a.data(), sizeof(T) * a.size(),
+                                   cudaMemcpyHostToDevice);
+    cudaError_t b_err = cudaMemcpy(b_data, b.data(), sizeof(T) * b.size(),
+                                   cudaMemcpyHostToDevice);
+
+    if (!(a_err == cudaSuccess && b_err == cudaSuccess)) {
+      throw std::runtime_error("Failed to cudaMemcpy to device");
+    }
+    cudaEventRecord(h2d_stop);
+
+    // Record Kernel Time Taken
+    cudaEventRecord(k_start);
+    VectorAdd<<<grid, threads>>>(a_data, b_data, c_data, a.size());
+    cudaEventRecord(k_stop);
+
+    // Record Time Take for D2H
+    cudaEventRecord(d2h_start);
+    cudaError_t c_err = cudaMemcpy(c.data(), c_data, sizeof(T) * c.size(),
+                                   cudaMemcpyDeviceToHost);
+
+    if (!(c_err == cudaSuccess)) {
+      throw std::runtime_error("Failed to cudaMemcpy back to host");
+    }
+    cudaEventRecord(d2h_stop);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, h2d_start, h2d_stop);
+    h2d_samples.push_back(ms);
+    cudaEventElapsedTime(&ms, k_start, k_stop);
+    k_samples.push_back(ms);
+    cudaEventElapsedTime(&ms, d2h_start, d2h_stop);
+    d2h_samples.push_back(ms);
+    cudaEventElapsedTime(&ms, start, stop);
+    samples.push_back(ms);
+  }
+
+  std::cout << "Overall Time Samples" << "\n";
+  OutStats(samples, a.size(), sizeof(T), 3);
+  std::cout << "\n";
+
+  std::cout << "H2D Samples" << "\n";
+  OutStats(h2d_samples, a.size(), sizeof(T), 2);
+  std::cout << "\n";
+
+  std::cout << "D2H Samples" << "\n";
+  OutStats(d2h_samples, a.size(), sizeof(T), 1);
+  std::cout << "\n";
+
+  std::cout << "Kernel Samples" << "\n";
+  OutStats(k_samples, a.size(), sizeof(T), 3);
+  std::cout << "\n";
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
+  cudaEventDestroy(h2d_start);
+  cudaEventDestroy(h2d_stop);
+  cudaEventDestroy(d2h_start);
+  cudaEventDestroy(d2h_stop);
+  cudaEventDestroy(k_start);
+  cudaEventDestroy(k_stop);
+  cudaFree(a_data);
+  cudaFree(b_data);
+  cudaFree(c_data);
+}
+
+// cudaVector with proper metric implementation
+//  This assumes vectors are the same size
+template <typename T>
+void cudaVectorAdd(cudaVector<T> &a, cudaVector<T> &b, cudaVector<T> &dest) {
+  dest.resize(a.size());
+
+  // Event Recording
+  cudaEvent_t start, stop, h2d_start, h2d_stop, d2h_start, d2h_stop, k_start,
+      k_stop;
+  std::vector<float> samples, h2d_samples, d2h_samples, k_samples;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  cudaEventCreate(&h2d_start);
+  cudaEventCreate(&h2d_stop);
+  cudaEventCreate(&d2h_start);
+  cudaEventCreate(&d2h_stop);
+  cudaEventCreate(&k_start);
+  cudaEventCreate(&k_stop);
+
+  T *a_data, *b_data, *c_data;
+  cudaMalloc(&a_data, sizeof(T) * a.size());
+  cudaMalloc(&b_data, sizeof(T) * b.size());
+  cudaMalloc(&c_data, sizeof(T) * dest.size());
+
+  auto [grid, threads] = gridSize<T>();
+
+  // warm up runs
+  for (size_t i = 0; i < 100; i++) {
+    cudaMemcpy(a_data, a.data(), sizeof(T) * a.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(b_data, b.data(), sizeof(T) * b.size(), cudaMemcpyHostToDevice);
+
+    VectorAdd<<<grid, threads>>>(a_data, b_data, c_data, a.size());
+
+    cudaMemcpy(dest.data(), c_data, sizeof(T) * dest.size(),
+               cudaMemcpyDeviceToHost);
+  }
+
+  // Measured Runs
+  for (size_t i = 0; i < 1000; i++) {
+    // Overall recording
+    cudaEventRecord(start);
+
+    // Memcpy recording
+    cudaEventRecord(h2d_start);
+    cudaError_t a_err = cudaMemcpy(a_data, a.data(), sizeof(T) * a.size(),
+                                   cudaMemcpyHostToDevice);
+    cudaError_t b_err = cudaMemcpy(b_data, b.data(), sizeof(T) * b.size(),
+                                   cudaMemcpyHostToDevice);
+
+    if (!(a_err == cudaSuccess && b_err == cudaSuccess)) {
+      throw std::runtime_error("Failed to cudaMemcpy");
+    }
+    cudaEventRecord(h2d_stop);
+
+    // Kernel recording
+    cudaEventRecord(k_start);
+    VectorAdd<<<grid, threads>>>(a_data, b_data, c_data, a.size());
+    cudaEventRecord(k_stop);
+
+    // Memcpy to Host recording
+    cudaEventRecord(d2h_start);
+    cudaError_t c_err = cudaMemcpy(dest.data(), c_data, sizeof(T) * dest.size(),
+                                   cudaMemcpyDeviceToHost);
+
+    if (c_err != cudaSuccess) {
+      throw std::runtime_error("Failed to Memcpy back to host");
+    }
+    cudaEventRecord(d2h_stop);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    float ms;
+    cudaEventElapsedTime(&ms, start, stop);
+    samples.push_back(ms);
+    cudaEventElapsedTime(&ms, h2d_start, h2d_stop);
+    h2d_samples.push_back(ms);
+    cudaEventElapsedTime(&ms, k_start, k_stop);
+    k_samples.push_back(ms);
+    cudaEventElapsedTime(&ms, d2h_start, d2h_stop);
+    d2h_samples.push_back(ms);
+  }
+
+  std::cout << "Overall Time \n";
+  OutStats(samples, a.size(), sizeof(T), 3);
+
+  std::cout << "H2D Samples \n";
+  OutStats(h2d_samples, a.size(), sizeof(T), 2);
+
+  std::cout << "Kernel Samples \n";
+  OutStats(k_samples, a.size(), sizeof(T), 3);
+
+  std::cout << "D2H Samples \n";
+  OutStats(d2h_samples, a.size(), sizeof(T), 1);
+}
+
+// With streams we can chunk the data up
+template <typename T>
+void cudaVectorAddStreams(cudaVector<T> &a, cudaVector<T> &b,
+                          cudaVector<T> &dest, size_t stream_num) {
+
+  cudaEvent_t start, stop;
+  cudaEventCreate(&start);
+  cudaEventCreate(&stop);
+  std::vector<float> samples, h2d_samples, d2h_samples, k_samples;
+
+  dest.resize(a.size());
+  T *a_data, *b_data, *c_data;
+
+  cudaMalloc(&a_data, sizeof(T) * a.size());
+  cudaMalloc(&b_data, sizeof(T) * b.size());
+  cudaMalloc(&c_data, sizeof(T) * dest.size());
+
+  // List of streams
+  std::vector<cudaStream_t> streams(stream_num);
+  for (auto &stream : streams) {
+    cudaStreamCreate(&stream);
+  }
+
+  auto [grid, threads] = gridSize<T>();
+
+  // warm up
+  size_t chunkSize = (a.size() + stream_num - 1) / stream_num;
+
+  cudaMemcpy(a_data, a.data(), a.size() * sizeof(T), cudaMemcpyHostToDevice);
+  cudaMemcpy(b_data, b.data(), b.size() * sizeof(T), cudaMemcpyHostToDevice);
+
+  for (size_t j = 0; j < 5; j++) {
+    for (size_t i = 0; i < stream_num; i++) {
+      size_t start = i * chunkSize;
+      size_t elemCount = std::min(chunkSize, a.size() - start);
+      VectorAdd<<<grid, threads, 0, streams[i]>>>(
+          a_data + start, b_data + start, c_data + start, elemCount);
+    }
+
+    cudaDeviceSynchronize();
+    cudaMemcpy(dest.data(), c_data, dest.size() * sizeof(T),
+               cudaMemcpyDeviceToHost);
+
+    for (size_t h = 0; h < dest.size(); h++) {
+      if (dest[h] != a[h] + b[h]) {
+        std::cout << "Values Given: \n";
+        std::cout << "Dest: " << dest[h] << "\n";
+        std::cout << "Vector 1: " << a[h] << "\n";
+        std::cout << "Vector 2: " << b[h] << "\n";
+        std::cout << "Element ID: " << h << "\n";
+
+        throw std::runtime_error("Stream Addition incorrect");
+      }
+    }
+  }
+
+  float ms;
+  // Measured Runs
+  for (size_t runs = 0; runs < 1000; runs++) {
+    cudaEventRecord(start);
+
+    for (size_t i = 0; i < stream_num; i++) {
+      size_t offset = i * chunkSize;
+      size_t elemCount = std::min(chunkSize, a.size() - offset);
+      size_t bytes = elemCount * sizeof(T);
+
+      // Async Mem Copy
+      cudaError_t a_copy = cudaMemcpyAsync(a_data + offset, a.data() + offset,
+                                           bytes, cudaMemcpyHostToDevice, streams[i]);
+      cudaError_t b_copy = cudaMemcpyAsync(b_data + offset, b.data() + offset,
+                                           bytes, cudaMemcpyHostToDevice, streams[i]);
+      if (!(a_copy == cudaSuccess && b_copy == cudaSuccess)) {
+        throw std::runtime_error("Failed to copy");
+      }
+
+      // Kernel
+      VectorAdd<<<grid, threads, 0, streams[i]>>>(
+          a_data + offset, b_data + offset, c_data + offset, elemCount);
+
+      // Async Mem Copy
+      cudaError_t c_copy = cudaMemcpyAsync(dest.data() + offset, c_data + offset,
+                                           bytes, cudaMemcpyDeviceToHost, streams[i]);
+      if (c_copy != cudaSuccess) {
+        throw std::runtime_error("Failed to copy to Host");
+      }
+    }
+
+    cudaDeviceSynchronize();
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&ms, start, stop);
+    samples.push_back(ms);
+  }
+
+  OutStats(samples, a.size(), sizeof(T), 3);
+
+  for (auto &stream : streams) {
+    cudaStreamDestroy(stream);
+  }
+
+  cudaEventDestroy(start);
+  cudaEventDestroy(stop);
 }
 
 // CPU only implementation
 template <typename T>
-requires (!((is_same_v<T, string>) || (is_same_v<T, char>)))
-vector<T> VectorAddCPU(vector<T>& a, vector<T>& b) {
-    int size = a.size() >= b.size() ? a.size() : b.size();
-    vector<T> result(size);
-    for (int i = 0; i < size; i++) {
-        if (i > a.size()) {
-            a.emplace_back();
-        }
-        if (i > b.size()) {
-            b.emplace_back();
-        }
+  requires(!((std::is_same_v<T, std::string>) || (std::is_same_v<T, char>)))
+std::vector<T> VectorAddCPU(std::vector<T> &a, std::vector<T> &b) {
+  std::vector<T> result(a.size());
+  std::vector<double> samples;
 
-        result[i] = a[i] + b[i];
+  // 1000 runs
+  for (size_t j = 0; j < 1000; j++) {
+    auto t0 = std::chrono::steady_clock::now();
+    for (size_t k = 0; k < a.size(); k++) {
+      result[k] = a[k] + b[k];
     }
+    auto t1 = std::chrono::steady_clock::now();
+    auto ms =
+        std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(
+            t1 - t0);
+    samples.push_back(ms.count());
+  }
 
-    return result;
+  OutStats(samples, a.size(), sizeof(T), 3);
+  return result;
 }
 
 int main() {
-    vector<int> a = {1,2,3};
-    vector<int> b = {2,3,4};
+  cudaFree(0);
 
-    vector<int> c = VectorAddCPU(a, b);
+  cudaDeviceProp prop;
+  cudaGetDeviceProperties(&prop, 0);
+  std::cout << "asyncEngineCount: " << prop.asyncEngineCount << "\n";
 
-    for (const auto& num : c) {
-        cout << num; 
-        if (&num != &c.back()) {
-            cout << ",";
-        }
-    }
+  int size = 0;
+  std::cout << "Size of vector to add? \n";
+  std::cin >> size;
 
-    cout << "\n";
-    
-    int size = 0;
-    cout << "Size of vector to add? \n";
-    cin >> size;
-    vector<int> d(size);
-    
-    iota(d.begin(), d.end(), 1);
+  std::vector<int> a(size);
+  std::vector<int> b(size);
 
-    vector<int> e(size);
+  iota(a.begin(), a.end(), 1);
 
-    iota(e.begin(), e.end(), 1);
+  iota(b.begin(), b.end(), 1);
 
-    vector<int> f;
+  std::cout << "CPU Version \n";
 
-    VectorAddSetup<int>(d, e,f);
+  std::vector<int> c = VectorAddCPU(a, b);
 
-    for (const auto& num : f) { 
-        cout << num;
-        if (&num != &f.back()) {
-            cout << ",";
-        }
-    }
+  std::vector<int> d(size);
 
-    cout << "\n";
+  iota(d.begin(), d.end(), 1);
 
-    return 0;
+  std::vector<int> e(size);
+
+  iota(e.begin(), e.end(), 1);
+
+  std::vector<int> f;
+
+  VectorAddSetup(d, e, f);
+
+  // Now with my cudaVector implementation
+  cudaVector<int> cVa(size);
+
+  std::iota(cVa.begin(), cVa.end(), 1);
+
+  cudaVector<int> cVb(size);
+
+  std::iota(cVb.begin(), cVb.end(), 1);
+
+  cudaVector<int> cVc;
+
+  std::cout << "Pinned Page-Locked Version \n";
+
+  cudaVectorAdd(cVa, cVb, cVc);
+
+  std::cout << "Pinned Page-Locked Version + Streams \n";
+
+  cudaVectorAddStreams(cVa, cVb, cVc, 8);
+
+  return 0;
 }
