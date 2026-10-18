@@ -1,7 +1,4 @@
-#include <algorithm>
-#include <cassert>
 #include <chrono>
-#include <cuda_device_runtime_api.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <driver_types.h>
@@ -10,11 +7,12 @@
 #include <ratio>
 #include <stdexcept>
 #include <stdlib.h>
-#include <type_traits>
+#include <string>
 #include <vector>
-#include <cmath>
+#include <algorithm>
 
 #include "cudaVector.cuh"
+#include "lib.cuh"
 
 template <typename T> __global__ void VectorAdd(T *a, T *b, T *dest, int size) {
   // This gives the global thread we are on
@@ -35,62 +33,6 @@ template <typename T> __global__ void VectorAdd(T *a, T *b, T *dest, int size) {
   }
 
   return;
-}
-
-template <typename T> std::pair<int, int> gridSize(int threadsPerBlock = 256) {
-  cudaDeviceProp prop;
-  int deviceID = 0;
-  cudaGetDeviceProperties(&prop, deviceID);
-  int numSMs = prop.multiProcessorCount;
-
-  // Calculate optimal number of blocks (per sm) to use at 256 threads
-  int maxBlockPerSM = 0;
-  size_t dynamicSMemSize = 0;
-  cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-      &maxBlockPerSM, VectorAdd<T>, threadsPerBlock, dynamicSMemSize);
-  return {numSMs * maxBlockPerSM, threadsPerBlock};
-};
-
-template <typename T>
-void OutStats(std::vector<T> &samples, size_t vectorsize, size_t typesize,
-              size_t arraystouched) {
-  if (samples.empty()) {
-    std::cout << "Samples are empty" << "\n";
-  }
-  float total = 0;
-
-  for (const auto &sample : samples) {
-    // std::cout << sample << "\n";
-    total += sample;
-  }
-
-  std::cout << "Mean: " << total / samples.size() << "ms" << "\n";
-
-  // Sorted for median
-  std::sort(samples.begin(), samples.end());
-  size_t m = samples.size();
-  float median = m % 2 == 0 ? (samples[m / 2 - 1] + samples[m / 2]) / 2.0f
-                            : samples[m / 2];
-
-  std::cout << "Median: " << median << "ms" << "\n";
-  std::cout << "Min: " << samples.front() << "ms" << "\n";
-  std::cout << "Top 5%: " << samples[round(samples.size() * 0.05)] << "ms"
-            << "\n";
-  std::cout << "Top 25%: " << samples[round(samples.size() * 0.25)] << "ms"
-            << "\n";
-  std::cout << "Bottom 5%: " << samples[round(samples.size() * 0.95)] << "ms"
-            << "\n";
-  std::cout << "Bottom 25%: " << samples[round(samples.size() * 0.75)] << "ms"
-            << "\n";
-
-  std::cout << "BANDWIDTH (gb/s) \n";
-  std::cout << "Median Bandwidth: "
-            << (arraystouched * vectorsize * typesize) / 1e9 / (median / 1000)
-            << "\n";
-  std::cout << "Min (Runtime) Bandwidth: "
-            << (arraystouched * vectorsize * typesize) / 1e9 /
-                   (samples.front() / 1000)
-            << "\n";
 }
 
 // Using the kernel (assumes a.size() == b.size())
@@ -114,7 +56,7 @@ void VectorAddSetup(std::vector<T> &a, std::vector<T> &b, std::vector<T> &c) {
   cudaEventCreate(&k_start);
   cudaEventCreate(&k_stop);
 
-  auto [grid, threads] = gridSize<T>();
+  auto [grid, threads] = gridSize(VectorAdd<T>);
 
   // Warmup runs
   for (int i = 0; i < 100; i++) {
@@ -247,7 +189,7 @@ void cudaVectorAdd(cudaVector<T> &a, cudaVector<T> &b, cudaVector<T> &dest) {
   cudaMalloc(&b_data, sizeof(T) * b.size());
   cudaMalloc(&c_data, sizeof(T) * dest.size());
 
-  auto [grid, threads] = gridSize<T>();
+  auto [grid, threads] = gridSize(VectorAdd<T>);
 
   // warm up runs
   for (size_t i = 0; i < 100; i++) {
@@ -346,7 +288,7 @@ void cudaVectorAddStreams(cudaVector<T> &a, cudaVector<T> &b,
     cudaStreamCreate(&stream);
   }
 
-  auto [grid, threads] = gridSize<T>();
+  auto [grid, threads] = gridSize(VectorAdd<T>);
 
   // warm up
   size_t chunkSize = (a.size() + stream_num - 1) / stream_num;
@@ -390,10 +332,12 @@ void cudaVectorAddStreams(cudaVector<T> &a, cudaVector<T> &b,
       size_t bytes = elemCount * sizeof(T);
 
       // Async Mem Copy
-      cudaError_t a_copy = cudaMemcpyAsync(a_data + offset, a.data() + offset,
-                                           bytes, cudaMemcpyHostToDevice, streams[i]);
-      cudaError_t b_copy = cudaMemcpyAsync(b_data + offset, b.data() + offset,
-                                           bytes, cudaMemcpyHostToDevice, streams[i]);
+      cudaError_t a_copy =
+          cudaMemcpyAsync(a_data + offset, a.data() + offset, bytes,
+                          cudaMemcpyHostToDevice, streams[i]);
+      cudaError_t b_copy =
+          cudaMemcpyAsync(b_data + offset, b.data() + offset, bytes,
+                          cudaMemcpyHostToDevice, streams[i]);
       if (!(a_copy == cudaSuccess && b_copy == cudaSuccess)) {
         throw std::runtime_error("Failed to copy");
       }
@@ -403,8 +347,9 @@ void cudaVectorAddStreams(cudaVector<T> &a, cudaVector<T> &b,
           a_data + offset, b_data + offset, c_data + offset, elemCount);
 
       // Async Mem Copy
-      cudaError_t c_copy = cudaMemcpyAsync(dest.data() + offset, c_data + offset,
-                                           bytes, cudaMemcpyDeviceToHost, streams[i]);
+      cudaError_t c_copy =
+          cudaMemcpyAsync(dest.data() + offset, c_data + offset, bytes,
+                          cudaMemcpyDeviceToHost, streams[i]);
       if (c_copy != cudaSuccess) {
         throw std::runtime_error("Failed to copy to Host");
       }
@@ -450,7 +395,7 @@ std::vector<T> VectorAddCPU(std::vector<T> &a, std::vector<T> &b) {
             t1 - t0);
     samples.push_back(ms.count());
   }
-  volatile T sink = result[result.size()/2];
+  volatile T sink = result[result.size() / 2];
 
   OutStats(samples, a.size(), sizeof(T), 3);
   return result;
